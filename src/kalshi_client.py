@@ -1,10 +1,16 @@
 """Minimal Kalshi trade API v2 client with RSA-PSS request signing.
 
-Docs: https://trading-api.readme.io/reference/getting-started
+Docs: https://docs.kalshi.com/ (Getting Started -> Authenticated Requests)
 Every authenticated request must include:
   KALSHI-ACCESS-KEY:       your API key id
   KALSHI-ACCESS-TIMESTAMP: current time in milliseconds since epoch
   KALSHI-ACCESS-SIGNATURE: base64(RSA-PSS-SHA256(timestamp + method + path))
+
+The signed `path` is the full request path INCLUDING the /trade-api/v2
+prefix (and excluding the query string) -- e.g. "/trade-api/v2/portfolio/balance",
+not just "/portfolio/balance". Getting this wrong is a common source of
+signature-verification failures, so it's handled centrally by API_PREFIX
+below rather than left to callers.
 """
 from __future__ import annotations
 
@@ -19,6 +25,9 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from src.config import CONFIG
 
 
+API_PREFIX = "/trade-api/v2"
+
+
 class KalshiAPIError(RuntimeError):
     pass
 
@@ -26,7 +35,7 @@ class KalshiAPIError(RuntimeError):
 class KalshiClient:
     def __init__(self, key_id: str | None = None, private_key_path: str | None = None, base_url: str | None = None):
         self.key_id = key_id or CONFIG.kalshi_api_key_id
-        self.base_url = (base_url or CONFIG.kalshi_base_url).rstrip("/")
+        self.host = (base_url or CONFIG.kalshi_host).rstrip("/")
         self._private_key = None
         path = private_key_path or CONFIG.kalshi_private_key_path
         if path:
@@ -51,18 +60,19 @@ class KalshiClient:
         )
         return base64.b64encode(signature).decode("utf-8")
 
-    def _headers(self, method: str, path: str) -> dict:
+    def _headers(self, method: str, signed_path: str) -> dict:
         timestamp_ms = str(int(time.time() * 1000))
         return {
             "KALSHI-ACCESS-KEY": self.key_id,
             "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-            "KALSHI-ACCESS-SIGNATURE": self._sign(timestamp_ms, method, path),
+            "KALSHI-ACCESS-SIGNATURE": self._sign(timestamp_ms, method, signed_path),
             "Content-Type": "application/json",
         }
 
     def _request(self, method: str, path: str, *, authenticated: bool = True, **kwargs) -> Any:
-        url = f"{self.base_url}{path}"
-        headers = self._headers(method, path) if authenticated else {}
+        full_path = f"{API_PREFIX}{path}"
+        url = f"{self.host}{full_path}"
+        headers = self._headers(method, full_path) if authenticated else {}
         resp = requests.request(method, url, headers=headers, timeout=10, **kwargs)
         if not resp.ok:
             raise KalshiAPIError(f"{method} {path} -> {resp.status_code}: {resp.text}")

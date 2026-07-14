@@ -35,11 +35,19 @@ class Config:
     btc_series_ticker: str = os.getenv("BTC_SERIES_TICKER", "KXBTCD")
     coinbase_ws_url: str = os.getenv("COINBASE_WS_URL", "wss://ws-feed.exchange.coinbase.com")
 
+    # Override if the host below doesn't match what's live in Kalshi's docs
+    # (docs.kalshi.com was unreachable from this environment when this was
+    # written -- verify the exact host yourself before going live; the
+    # /trade-api/v2 prefix is stable and handled separately in kalshi_client.py).
+    kalshi_base_url_override: str = os.getenv("KALSHI_BASE_URL", "")
+
     @property
-    def kalshi_base_url(self) -> str:
+    def kalshi_host(self) -> str:
+        if self.kalshi_base_url_override:
+            return self.kalshi_base_url_override.rstrip("/")
         if self.kalshi_env == "prod":
-            return "https://trading-api.kalshi.com/trade-api/v2"
-        return "https://demo-api.kalshi.co/trade-api/v2"
+            return "https://api.elections.kalshi.com"
+        return "https://demo-api.kalshi.co"
 
 
 CONFIG = Config()

@@ -75,6 +75,24 @@ cp .env.example .env
    KALSHI_ENV=demo
    ```
 
+### About the API host
+
+`docs.kalshi.com` was not reachable from the environment this bot was built
+in (blocked by network policy), so the exact base URL in `src/config.py`
+(`kalshi_host`) is taken from third-party guides, not Kalshi's own docs, and
+could be stale. **Before running in live mode**, check the current host
+yourself at [docs.kalshi.com](https://docs.kalshi.com/getting_started/quick_start_authenticated_requests)
+and, if it differs, set it explicitly rather than editing the code:
+
+```
+KALSHI_BASE_URL=https://whatever-the-docs-say.kalshi.com
+```
+
+The `/trade-api/v2` path prefix is handled separately in
+`kalshi_client.py` and included in the signed request path, per Kalshi's
+authentication scheme (sign `timestamp_ms + method + full_path`, where
+`full_path` includes the `/trade-api/v2` prefix).
+
 ### Find the right market series ticker
 
 Kalshi's BTC 15-minute markets live under a series ticker (check the current
