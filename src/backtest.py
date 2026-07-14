@@ -1,163 +1,162 @@
-"""Backtest the strategy against historical BTC price data.
+"""Backtest the Up/Down pricing model on historical per-second prices.
 
 IMPORTANT LIMITATION -- read before trusting any number this produces:
 
-Kalshi does not publish a free historical feed of past order-book prices for
-settled 15-minute BTC markets. Without real historical market prices, we
-cannot replay "what would the market have offered, and would our model have
-disagreed enough to trade." This script instead simulates a *synthetic*
-market maker that prices each contract using the SAME pricing model the
-strategy uses, plus injected noise/spread. That means:
+Kalshi does not publish a free historical order-book feed for settled
+15-minute markets, so the "market" this backtest trades against is
+SYNTHETIC: a lagged, noised, spread-wrapped version of the model's own fair
+value. That validates plumbing (window mechanics, settlement averaging,
+sizing, fees, risk caps) and gives a rough sense of how often a
+latency/staleness edge appears -- it CANNOT prove real edge against
+Kalshi's actual market makers. Validate with MODE=paper against live
+quotes before believing anything.
 
-  - It can validate that the strategy's plumbing (sizing, risk limits,
-    settlement) works correctly.
-  - It CANNOT tell you whether the model has a real edge over Kalshi's actual
-    market makers, because the "market" here is not real. A strategy that
-    looks profitable against its own model, priced with its own model, is
-    close to circular by construction.
+Input CSV: columns `timestamp,price` at ~1-second resolution (a recording
+of the bot's own BRTI estimate works well -- the estimator logs samples).
 
-To actually validate edge, you need one of:
-  1. Live paper trading against real Kalshi market prices (MODE=paper) for
-     an extended period, comparing model probability vs. actual quotes.
-  2. Kalshi's historical trades/candlestick endpoints (available to
-     authenticated accounts for some markets) fed in as `market_price_cents`
-     instead of the synthetic quote below.
-
-Input: a CSV with columns `timestamp` (unix seconds) and `price` (BTC-USD),
-at roughly 1-second or better resolution. Produces 15-minute windows,
-computes realized vol trailing each window, and reports simulated PnL.
+Simulation per 15-minute window:
+  strike  = mean of prices in [open-60, open)   (the previous settlement)
+  settle  = mean of prices in [open+840, open+900)
+  each second, the synthetic market quotes fair(lagged spot) +/- spread
+  with noise; the taker logic fires when the true-fair vs quote gap clears
+  fees + MIN_TAKER_EDGE.
 """
 from __future__ import annotations
 
 import argparse
-import math
+import csv
 import random
+import statistics
 from dataclasses import dataclass
 
-import pandas as pd
+from src.config import CONFIG
+from src.fees import fee_per_contract
+from src.pricing import EwmaVol, prob_settle_above
 
-from src.pricing_model import fair_value_above_strike
-from src.risk_manager import RiskManager
-
-WINDOW_SECONDS = 15 * 60
-VOL_LOOKBACK_SECONDS = 30 * 60
-SYNTHETIC_SPREAD_CENTS = 2.0  # market maker spread baked into the synthetic quote
-SYNTHETIC_NOISE_STD_CENTS = 3.0  # random mispricing noise around the "true" model price
+WINDOW_S = 15 * 60
+AVG_S = 60
+SYNTH_LAG_S = 3           # how stale the synthetic market maker's spot is
+SYNTH_NOISE = 0.02        # gaussian noise on the synthetic quote (prob units)
+SYNTH_HALF_SPREAD = 0.02
 
 
 @dataclass
-class Trade:
-    window_start: float
-    side: str
+class WindowResult:
+    open_ts: float
+    strike: float
+    settle: float
+    trades: int
     contracts: int
-    entry_price_cents: float
-    resolved_yes: bool
-    pnl_usd: float
+    pnl: float
 
 
-def _annualized_realized_vol(returns_per_sqrt_sec: list[float]) -> float | None:
-    if len(returns_per_sqrt_sec) < 5:
-        return None
-    mean = sum(returns_per_sqrt_sec) / len(returns_per_sqrt_sec)
-    var = sum((r - mean) ** 2 for r in returns_per_sqrt_sec) / (len(returns_per_sqrt_sec) - 1)
-    seconds_per_year = 365 * 24 * 3600
-    return math.sqrt(var) * math.sqrt(seconds_per_year)
+def load_series(path: str) -> list[tuple[float, float]]:
+    rows: list[tuple[float, float]] = []
+    with open(path, newline="") as f:
+        for rec in csv.DictReader(f):
+            rows.append((float(rec["timestamp"]), float(rec["price"])))
+    rows.sort(key=lambda x: x[0])
+    return rows
 
 
-def _synthetic_market_quote(true_prob_yes: float, rng: random.Random) -> tuple[float, float]:
-    """Fabricates yes_ask/no_ask around the model's own probability, with
-    spread and noise, purely so the sizing/risk/settlement logic has
-    something to trade against. See module docstring for why this cannot
-    validate real edge."""
-    true_price = true_prob_yes * 100
-    noisy_mid = max(1.0, min(99.0, true_price + rng.gauss(0, SYNTHETIC_NOISE_STD_CENTS)))
-    yes_ask = min(99.0, noisy_mid + SYNTHETIC_SPREAD_CENTS / 2)
-    no_ask = min(99.0, (100 - noisy_mid) + SYNTHETIC_SPREAD_CENTS / 2)
-    return yes_ask, no_ask
-
-
-def run_backtest(csv_path: str, min_edge_cents: float = 4.0, seed: int = 42) -> list[Trade]:
-    df = pd.read_csv(csv_path).sort_values("timestamp")
+def run_backtest(series: list[tuple[float, float]], seed: int = 7) -> list[WindowResult]:
     rng = random.Random(seed)
-    risk_manager = RiskManager()
-    trades: list[Trade] = []
+    cfg = CONFIG
+    if not series:
+        return []
 
-    t_start = df["timestamp"].iloc[0]
-    t_end = df["timestamp"].iloc[-1]
+    # Second-indexed lookup for O(1) access.
+    by_sec = {int(ts): px for ts, px in series}
+    t0, t1 = int(series[0][0]), int(series[-1][0])
 
-    window_start = t_start
-    while window_start + WINDOW_SECONDS <= t_end:
-        window_end = window_start + WINDOW_SECONDS
-        vol_window = df[(df.timestamp >= window_start - VOL_LOOKBACK_SECONDS) & (df.timestamp <= window_start)]
-        if len(vol_window) < 10:
-            window_start = window_end
+    vol = EwmaVol(half_life_s=cfg.vol_half_life_s, min_samples=cfg.vol_min_samples,
+                  floor_annual=cfg.vol_floor_annual, cap_annual=cfg.vol_cap_annual)
+    results: list[WindowResult] = []
+
+    window_open = t0 + AVG_S + 1
+    while window_open + WINDOW_S <= t1:
+        close_ts = window_open + WINDOW_S
+        pre = [by_sec[s] for s in range(window_open - AVG_S, window_open) if s in by_sec]
+        post = [by_sec[s] for s in range(close_ts - AVG_S, close_ts) if s in by_sec]
+        if len(pre) < AVG_S * 0.8 or len(post) < AVG_S * 0.8:
+            window_open += WINDOW_S
             continue
+        strike = statistics.fmean(pre)
+        settle = statistics.fmean(post)
 
-        prices = vol_window["price"].to_numpy()
-        times = vol_window["timestamp"].to_numpy()
-        returns = []
-        for i in range(1, len(prices)):
-            dt = times[i] - times[i - 1]
-            if dt <= 0 or prices[i - 1] <= 0 or prices[i] <= 0:
+        pnl = 0.0
+        trades = 0
+        contracts = 0
+        pos = 0
+        cash = 0.0
+        realized_sum = 0.0
+        realized_n = 0
+
+        for sec in range(window_open, close_ts):
+            px = by_sec.get(sec)
+            if px is None:
                 continue
-            returns.append(math.log(prices[i] / prices[i - 1]) / math.sqrt(dt))
-        vol = _annualized_realized_vol(returns)
+            vol.update(float(sec), px)
+            if not vol.ready:
+                continue
+            tau = close_ts - sec
+            if tau <= cfg.taker_stop_before_close_s:
+                break
+            if tau <= AVG_S:
+                realized_sum += round(px, 2)
+                realized_n += 1
 
-        window_df = df[(df.timestamp >= window_start) & (df.timestamp <= window_end)]
-        if vol is None or window_df.empty:
-            window_start = window_end
-            continue
+            fair = prob_settle_above(px, strike, tau, vol.sigma_s, AVG_S,
+                                     realized_sum if realized_n else None,
+                                     realized_n if realized_n else None)
+            lag_px = by_sec.get(sec - SYNTH_LAG_S, px)
+            mkt_mid = prob_settle_above(lag_px, strike, tau + SYNTH_LAG_S, vol.sigma_s, AVG_S)
+            mkt_mid = min(0.99, max(0.01, mkt_mid + rng.gauss(0.0, SYNTH_NOISE)))
+            ask = min(0.99, mkt_mid + SYNTH_HALF_SPREAD)
+            bid = max(0.01, mkt_mid - SYNTH_HALF_SPREAD)
 
-        spot_open = window_df["price"].iloc[0]
-        spot_close = window_df["price"].iloc[-1]
-        strike = spot_open  # Kalshi's 15-min markets commonly strike at-the-money at window open
+            edge_buy = fair - ask - fee_per_contract(ask, cfg.taker_fee_rate)
+            edge_sell = bid - fair - fee_per_contract(bid, cfg.taker_fee_rate)
+            size = cfg.max_taker_size
+            if edge_buy >= cfg.min_taker_edge and pos < cfg.max_pos_per_market:
+                n = min(size, cfg.max_pos_per_market - pos)
+                cash -= n * ask + fee_per_contract(ask, cfg.taker_fee_rate) * n
+                pos += n
+                trades += 1
+                contracts += n
+            elif edge_sell >= cfg.min_taker_edge and pos > -cfg.max_pos_per_market:
+                n = min(size, cfg.max_pos_per_market + pos)
+                cash += n * bid - fee_per_contract(bid, cfg.taker_fee_rate) * n
+                pos -= n
+                trades += 1
+                contracts += n
 
-        fv = fair_value_above_strike(spot_open, strike, WINDOW_SECONDS, vol)
-        yes_ask, no_ask = _synthetic_market_quote(fv.prob_yes, rng)
+        result_yes = settle > strike
+        pnl = cash + (pos if result_yes else 0)
+        results.append(WindowResult(window_open, strike, settle, trades, contracts, pnl))
+        window_open += WINDOW_S
 
-        yes_edge = fv.yes_price_cents - yes_ask
-        no_edge = fv.no_price_cents - no_ask
-
-        side, model_prob, price_cents = None, None, None
-        if yes_edge >= min_edge_cents and yes_edge >= no_edge:
-            side, model_prob, price_cents = "yes", fv.prob_yes, yes_ask
-        elif no_edge >= min_edge_cents:
-            side, model_prob, price_cents = "no", fv.prob_no, no_ask
-
-        if side is not None:
-            sizing = risk_manager.size_position(model_prob, price_cents)
-            contracts = sizing["contracts"]
-            if contracts > 0:
-                resolved_yes = spot_close > strike
-                won = (side == "yes") == resolved_yes
-                pnl_usd = ((100.0 if won else 0.0) - price_cents) / 100.0 * contracts
-                risk_manager.record_position_opened()
-                risk_manager.record_position_closed(pnl_usd)
-                trades.append(Trade(window_start, side, contracts, price_cents, resolved_yes, pnl_usd))
-
-        window_start = window_end
-
-    return trades
+    return results
 
 
-def summarize(trades: list[Trade]):
-    if not trades:
-        print("No trades generated.")
-        return
-    total_pnl = sum(t.pnl_usd for t in trades)
-    wins = sum(1 for t in trades if t.pnl_usd > 0)
-    print(f"Trades: {len(trades)}  Wins: {wins} ({wins/len(trades)*100:.1f}%)")
-    print(f"Total simulated PnL: ${total_pnl:.2f}")
-    print("\nNOTE: this PnL is against a SYNTHETIC market priced from the same")
-    print("model used to trade -- it demonstrates plumbing correctness, not real edge.")
-    print("See the module docstring for how to validate against real Kalshi prices.")
+def summarize(results: list[WindowResult]) -> None:
+    traded = [r for r in results if r.trades]
+    total = sum(r.pnl for r in traded)
+    print(f"windows: {len(results)}  traded: {len(traded)}  contracts: {sum(r.contracts for r in traded)}")
+    if traded:
+        wins = sum(1 for r in traded if r.pnl > 0)
+        print(f"win rate (windows): {wins}/{len(traded)} ({wins / len(traded) * 100:.1f}%)")
+        print(f"total simulated PnL: ${total:,.2f}")
+    print()
+    print("NOTE: PnL here is against a SYNTHETIC market derived from this same")
+    print("model (lagged + noised). It validates plumbing and the value of the")
+    print("settlement-averaging math -- it does NOT demonstrate real edge against")
+    print("Kalshi's live market. Use MODE=paper for that.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("csv_path", help="CSV with columns: timestamp,price")
-    parser.add_argument("--min-edge-cents", type=float, default=4.0)
+    parser.add_argument("csv_path", help="CSV with columns: timestamp,price (~1s resolution)")
+    parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
-
-    results = run_backtest(args.csv_path, min_edge_cents=args.min_edge_cents)
-    summarize(results)
+    summarize(run_backtest(load_series(args.csv_path), seed=args.seed))

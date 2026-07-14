@@ -1,186 +1,224 @@
-# Kalshi BTC 15-Minute Trading Bot
+# Kalshi 15-Minute Crypto Up/Down HFT Bot
 
-A framework for trading Kalshi's 15-minute Bitcoin price markets (binary
-contracts that pay $1 if BTC is above/below a strike at expiry, $0
-otherwise). It compares a statistical fair-value model to the current market
-price and only trades when it finds a large enough edge, sized with
-risk-capped Kelly criterion.
+An event-driven trading bot for Kalshi's 15-minute crypto **Up/Down** markets
+(default series: `KXBTC15M`, "Bitcoin Up or Down"). Each window, Kalshi lists
+a binary contract that pays $1 if the settlement value ends **above the
+"price to beat"** set at window open, $0 otherwise — and settles it on the
+**CME CF Bitcoin Real-Time Index (BRTI)**: specifically, the *mean of the
+final 60 one-second BRTI prints* before close.
+
+This bot's entire premise is to price that contract slightly better and
+slightly faster than the market by:
+
+1. **Replicating the BRTI in real time** from the same constituent exchange
+   order books CF Benchmarks uses (published methodology: consolidated book →
+   mid price-volume curve → utilized depth capped at 0.5% deviation, min
+   1 BTC → exponentially weighted mid with λ = 10.3), instead of watching a
+   single exchange's last trade.
+2. **Pricing the settlement average correctly.** A 60-second average is less
+   volatile than a point close (variance `σ²(a + w/3)`, not `σ²(a + w)`),
+   and inside the final minute part of the average is *already realized* —
+   the bot tracks the locked-in ticks and reprices as certainty accrues,
+   which is exactly when markets are most often mispriced.
+3. **Reacting on events, not polls**: Kalshi order book deltas over
+   websocket, 1 Hz index ticks, fills — with maker quotes and taker sweeps
+   driven off a single async event loop.
 
 **Read this before running anything:**
 
-> No bot can guarantee profit, and anyone who tells you otherwise is selling
-> something. Kalshi's market makers are professional and fast; a 15-minute
-> BTC binary is a genuinely hard market to have real edge in. This project
-> gives you a statistically sound way to *look for* edge and to size and
-> risk-manage trades if you find some — it does not hand you a money
-> printer. Start in paper mode. Expect to spend real time validating before
-> you ever touch live money.
+> No bot can guarantee profit. Kalshi's crypto market makers are
+> professional and fast, fees on crypto series are meaningful, and a
+> 15-minute binary is a genuinely hard market to beat. "HFT" here means
+> event-driven, sub-second *reaction* — order placement still crosses the
+> public internet to Kalshi's REST API (tens of ms at best) under
+> rate limits (~10 writes/sec on the basic tier). Nothing in this repo is
+> co-located-CME-speed, and nobody trading through the public API is.
+> Start in paper mode, expect to lose your assumed edge to fees and adverse
+> selection, and validate for a long time before risking real money.
+> This is not financial advice; trade only what you can afford to lose.
 
-## How it's supposed to work
+## Architecture
 
-1. **Price feed** (`src/btc_price_feed.py`) streams live BTC-USD trades from
-   Coinbase's public websocket and keeps a rolling realized-volatility
-   estimate.
-2. **Pricing model** (`src/pricing_model.py`) treats BTC's short-horizon path
-   as zero-drift geometric Brownian motion and computes the fair probability
-   that BTC finishes above a given strike in the time remaining — this
-   probability is also the fair dollar price of the YES contract.
-3. **Strategy** (`src/strategy.py`) pulls Kalshi's currently open 15-minute
-   BTC markets, computes the model's fair price for each, and compares it to
-   Kalshi's live ask. It only signals a trade when the disagreement (edge)
-   clears a configurable minimum, because a signal filtered on tiny edges is
-   mostly fees and noise.
-4. **Risk manager** (`src/risk_manager.py`) sizes each trade with fractional
-   Kelly, then hard-caps it at a fixed percentage of bankroll regardless of
-   what Kelly says — Kelly sizing is only as trustworthy as the probability
-   feeding it, and this model can be wrong. It also enforces a max number of
-   concurrent positions and a daily loss limit (kill switch).
-5. **Order manager** (`src/order_manager.py`) executes the signal — in paper
-   mode it simulates the fill locally and touches nothing external; in live
-   mode it places a real limit order via the Kalshi API.
-6. **Bot loop** (`src/bot.py`) ties the above together and polls on an
-   interval.
+```
+ Coinbase ─┐                                        ┌──────────────┐
+ Kraken   ─┤  L2 books   ┌─────────────────┐  1 Hz  │ EWMA vol     │
+ Bitstamp ─┼────────────▶│ BRTI estimator  │───────▶│ (per-√sec)   │
+ Gemini   ─┘             │ (CF methodology)│        └──────┬───────┘
+                         └────────┬────────┘               │
+                                  │ index ticks +          │ σ
+                                  │ settlement-window sum  │
+                                  ▼                        ▼
+ Kalshi ws ──────────────▶ ┌──────────────────────────────────┐
+ (orderbook_delta,         │  UpDownStrategy                  │
+  trade, fill)             │  fair = P(60s avg > strike)      │
+                           │  taker: IOC when edge > fee+min  │
+                           │  maker: post-only quotes, vol-   │
+                           │  adaptive spread, inventory skew │
+                           └───────────────┬──────────────────┘
+                                           │ place/cancel (rate-limited)
+                              ┌────────────┴────────────┐
+                              │ LiveExecution           │   MODE=live
+                              │ PaperExecution          │   MODE=paper
+                              └────────────┬────────────┘
+                                           ▼
+                              RiskManager: Kelly-capped sizing,
+                              position/notional caps, daily loss
+                              kill switch, staleness gates
+```
 
-## Why this can plausibly have edge (and where it can't)
+Module map:
 
-The model doesn't try to predict *direction* — it only prices probability
-consistently from volatility, the same way an options market maker prices a
-binary. Edge, if it exists, comes from Kalshi's market not perfectly tracking
-realized short-term volatility (e.g., stale quotes right after a vol regime
-shift, or retail order flow pushing prices away from fair value). That is a
-plausible but unproven edge — you need to validate it against real market
-data (see Backtesting below) before trusting it with money.
+| Path | What it does |
+|---|---|
+| `src/brti/feeds/` | Reconnecting public L2 feeds: Coinbase, Kraken, Bitstamp, Gemini |
+| `src/brti/index.py` | CF Real-Time-Index replica + 1 Hz sampler + settlement-window tracker |
+| `src/pricing.py` | Up/Down fair value under settlement averaging; EWMA vol |
+| `src/fees.py` | Kalshi fee formula (ceil-to-cent), netted out of every edge |
+| `src/kalshi/` | RSA-PSS signing, rate-limited async REST, websocket + book maintenance |
+| `src/strategy.py` | Event-driven maker/taker logic |
+| `src/execution.py` | Live + paper execution, signed-YES average-cost accounting |
+| `src/risk.py` | Sizing caps and kill switches |
+| `src/bot.py` | Orchestrator (`python -m src.bot`) |
+| `src/backtest.py` | Synthetic-market plumbing test (see limitations inside) |
 
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### Get Kalshi API credentials
+### Kalshi credentials (needed even for paper mode)
 
-1. Create an account at [kalshi.com](https://kalshi.com) (use the demo
-   environment at demo.kalshi.co first — it's fake money on real market
-   structure, and this bot defaults to it).
-2. Go to Account → API Keys, generate a key. Kalshi gives you an API key ID
-   and downloads an RSA private key (PEM file).
-3. Put the PEM file somewhere safe (never commit it — `.gitignore` already
-   excludes `*.pem` and `.env`) and point `.env` at it:
-   ```
-   KALSHI_API_KEY_ID=your-key-id
-   KALSHI_PRIVATE_KEY_PATH=/path/to/kalshi_private_key.pem
-   KALSHI_ENV=demo
-   ```
+The Kalshi websocket requires an authenticated connection, and paper mode
+consumes live Kalshi market data. Keys are free:
 
-### About the API host
-
-`docs.kalshi.com` was not reachable from the environment this bot was built
-in (blocked by network policy), so the exact base URL in `src/config.py`
-(`kalshi_host`) is taken from third-party guides, not Kalshi's own docs, and
-could be stale. **Before running in live mode**, check the current host
-yourself at [docs.kalshi.com](https://docs.kalshi.com/getting_started/quick_start_authenticated_requests)
-and, if it differs, set it explicitly rather than editing the code:
-
-```
-KALSHI_BASE_URL=https://whatever-the-docs-say.kalshi.com
-```
-
-The `/trade-api/v2` path prefix is handled separately in
-`kalshi_client.py` and included in the signed request path, per Kalshi's
-authentication scheme (sign `timestamp_ms + method + full_path`, where
-`full_path` includes the `/trade-api/v2` prefix).
-
-### Find the right market series ticker
-
-Kalshi's BTC 15-minute markets live under a series ticker (check the current
-one in Kalshi's markets browser — it changes as Kalshi renames/relaunches
-crypto series). Set it in `.env`:
-
-```
-BTC_SERIES_TICKER=KXBTCD
-```
+1. Create an account — use **demo.kalshi.co** first (fake money, real
+   market structure; this bot defaults to it).
+2. Account → API keys → create. Save the downloaded RSA private key PEM.
+3. In `.env`: set `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH`.
+   (`.gitignore` already excludes `.env` and `*.pem`.)
 
 ## Running
 
 ```bash
-# Safe default: real market data, simulated fills, nothing sent to Kalshi.
-MODE=paper python -m src.bot
+# Paper: real BRTI + Kalshi data, simulated fills, nothing ever sent. Default.
+python -m src.bot
 
-# Sends real orders. Only do this on KALSHI_ENV=demo until you trust the bot,
-# and only on KALSHI_ENV=prod once you've validated it with real money you
-# can afford to lose.
-MODE=live python -m src.bot
+# Live on the demo exchange (fake money), real order flow end to end:
+MODE=live KALSHI_ENV=demo python -m src.bot
+
+# Live with real money -- only after everything in "Verify before live":
+MODE=live KALSHI_ENV=prod python -m src.bot
 ```
 
-Watch the logs. In paper mode you'll see `[PAPER]` trade lines with no
-network side effects; in live mode you'll see `[LIVE]` lines confirming
-orders actually placed.
+Watch the status line: BRTI value, live feeds, per-market fair value vs
+market BBO, position, and day PnL. `[PAPER-TAKE]`/`[PAPER-MAKE]` lines mark
+simulated fills; `FILL`/`SETTLED` lines mark accounting events.
 
-## Backtesting — read the limitation
+Tests: `pytest tests/ -v` (77 tests, all offline — pricing math, BRTI
+aggregation, book maintenance across both wire formats, fees, risk gates,
+paper fills, and strategy decisions).
 
-```bash
-python -m src.backtest path/to/btc_prices.csv  # columns: timestamp,price
-```
+## Verify before going live — this matters
 
-**This backtest is not a substitute for paper trading.** Kalshi doesn't
-publish free historical order-book data for settled 15-minute markets, so
-`src/backtest.py` prices a synthetic market using the *same model* the
-strategy trades against (plus injected noise/spread). That validates the
-plumbing — sizing, risk limits, settlement math — but a strategy that looks
-profitable against its own model is close to circular by construction. It
-tells you the code works, not that the edge is real.
+This bot was written in an environment where `docs.kalshi.com`,
+`api.elections.kalshi.com`, and CF Benchmarks' site were **blocked by
+network policy**, so several facts were taken from Kalshi's published
+examples and third-party documentation rather than confirmed against the
+live API. All of them are cheap to check on the demo environment, and the
+bot is built to make each one a config change, not a code change:
 
-To actually validate edge, either:
-- Run `MODE=paper` for an extended period and compare the model's fair price
-  to Kalshi's actual live quotes before ever going live, or
-- Feed real historical Kalshi prices (from their historical trades/candle
-  endpoints, where available) into the backtest in place of the synthetic
-  quote.
+1. **Order wire format** (`KALSHI_ORDER_API`): default `v2` posts to
+   `/portfolio/events/orders` with `side: bid/ask` and decimal dollar
+   prices (current docs style); `legacy` posts to `/portfolio/orders` with
+   `side: yes/no + action` and integer cents (deprecation announced for
+   2026). Place one tiny demo order; if it 4xx's, flip the flag.
+2. **Fee rates** (`TAKER_FEE_RATE`, `MAKER_FEE_RATE`): crypto series carry
+   a higher multiplier than the general 0.07 and a reduced maker rate.
+   Check [kalshi.com/fee-schedule](https://kalshi.com/fee-schedule); the
+   defaults here (0.10 / 0.025) deliberately overestimate.
+3. **Series ticker** (`SERIES_TICKER`): `KXBTC15M` is the BTC 15-minute
+   Up/Down series as of mid-2026; Kalshi renames series occasionally. The
+   discovery loop logs what it finds — if it finds nothing, browse
+   kalshi.com's crypto section for the current name (`KXETH15M` for ETH).
+4. **Strike field**: the "price to beat" is read from the market's
+   `floor_strike` (with fallbacks). The tracking log line prints it — sanity
+   check it against the Kalshi UI for one window before trusting it.
+5. **Settlement mechanics**: contracts settle on the 60-second BRTI mean;
+   `SETTLEMENT_WINDOW_S`/`SETTLEMENT_TICKS` encode that and are
+   configurable if Kalshi's rulebook changes.
 
-## Configuration reference (`.env`)
+## Where the edge is supposed to come from (and where it leaks)
 
-| Variable | Meaning |
-|---|---|
-| `MODE` | `paper`, `live`, or use `src/backtest.py` directly |
-| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | API auth |
-| `KALSHI_ENV` | `demo` or `prod` |
-| `BANKROLL_USD` | Bankroll used for position sizing |
-| `MAX_RISK_PER_TRADE` | Hard cap on risk per trade, as a fraction of bankroll |
-| `MAX_CONCURRENT_POSITIONS` | Max simultaneous open positions |
-| `DAILY_LOSS_LIMIT_USD` | Kill switch: stop opening new trades after this much realized loss in a day |
-| `KELLY_FRACTION` | Fraction of full Kelly to use (0.25 = quarter-Kelly, conservative) |
-| `MIN_EDGE_CENTS` | Minimum model-vs-market disagreement (in cents) required to trade |
-| `BTC_SERIES_TICKER` | Kalshi series ticker for the BTC 15-min markets |
+- **BRTI vs single-exchange watchers.** Settlement is on a consolidated
+  index. Bots (and humans) pricing off Coinbase's last trade are pricing
+  the wrong underlying by a few dollars — small, but binaries near the
+  strike amplify small differences enormously in the final minutes.
+- **The averaging window.** Correctly pricing `P(avg > K)` — especially the
+  realized-tick collapse inside the last 60 seconds — is this bot's largest
+  systematic differentiator. A market quoting 12c of uncertainty when 50 of
+  60 ticks are locked in is offering nearly free money *if your index
+  replica is accurate*.
+- **Where it leaks:** taker fees at mid-probability prices (~2-3c round
+  trip), adverse selection on resting quotes (you get filled precisely when
+  fair value moved through you faster than you repriced), REST order
+  latency against other bots, and any systematic error between this BRTI
+  replica and the real print (LMAX Digital's book is not public, so the
+  replica is a subset of constituents). `MIN_TAKER_EDGE_CENTS` /
+  `MIN_MAKER_EDGE_CENTS` exist to demand enough margin to survive all four.
 
-## Tests
+## Risk controls (all enforced independently of the strategy)
 
-```bash
-pytest tests/ -v
-```
+| Control | Default | Behavior |
+|---|---|---|
+| Data staleness gate | BRTI 2.5s / Kalshi ws 5s | No fair value from stale data: quotes pulled, taking blocked |
+| Per-trade cap | 2% of bankroll | Hard cap regardless of Kelly's opinion |
+| Kelly fraction | 0.25 | Sizing from edge, quarter-strength |
+| Position cap | 50/market | Signed-YES contracts, both directions |
+| Notional cap | $500 | Total collateral at risk across markets |
+| Daily loss limit | $100 | Halts trading; requires restart (deliberate) |
+| Consecutive order errors | 5 | Halts (broken API assumptions ≠ keep firing) |
+| Quote TTL | 10s | Server-side expiry: a crashed bot bleeds off the book |
+| Close guards | 12s / 1.5s | Quoting stops first, taking stops last |
 
-## Realistic expectations
+Live mode also cancels all resting orders on shutdown, and rate-limits
+itself to the basic-tier token buckets (configurable if you have a higher
+tier).
 
-- Fees, slippage, and adverse selection (you tend to get filled when the
-  market is about to move against you) all eat into any edge this finds.
-  `MIN_EDGE_CENTS` exists to filter out trades too small to survive that.
-- Start with a bankroll you are fully prepared to lose. Quarter-Kelly with a
-  2% hard per-trade cap is deliberately conservative, not aggressive —
-  loosen it only after you have real evidence (not backtest numbers) that
-  the model has edge.
-- Treat the daily loss limit as non-negotiable. If it fires, stop and figure
-  out why before restarting the bot.
+## Backtesting — the honest version
 
-## What's not built yet (ideas for extending this)
+`python -m src.backtest data.csv` (CSV: `timestamp,price` at ~1s) replays
+15-minute windows with real settlement mechanics, but the counterparty is a
+**synthetic** market (the model's own fair value, lagged + noised + spread).
+That validates window/averaging/fee/sizing plumbing and quantifies the value
+of the realized-tick math — it cannot prove edge against Kalshi's real
+market makers, because it isn't them. The way to build a real edge dataset
+is `MODE=paper`: it trades against genuine Kalshi quotes and logs every
+model-vs-market divergence. Paper maker fills ignore queue priority
+(optimistic); treat paper PnL as an upper bound.
 
-- Order-book-aware execution (posting inside the spread instead of hitting
-  the ask) to reduce the cost paid per trade.
-- A live model-vs-market divergence logger to build a real edge dataset over
-  time, independent of the (circular) synthetic backtest.
-- Multi-exchange spot price consensus (Coinbase + Binance + Kraken) instead
-  of a single feed, to reduce feed-specific noise.
-- Automatic position settlement polling (currently `settle_position` must be
-  called manually / wired into a scheduler once you confirm Kalshi's
-  settlement endpoint behavior for your account).
+## Config reference
+
+Every knob lives in `.env` — see `.env.example`, which documents each one.
+The high-leverage ones: `MIN_TAKER_EDGE_CENTS` (selectivity), `QUOTE_SIZE` /
+`MAX_POS_PER_MARKET` (inventory), `MAKER_VOL_MULT` (quote width vs vol),
+`TAKER_FEE_RATE`/`MAKER_FEE_RATE` (must match the live fee schedule), and
+`ENABLE_MAKER`/`ENABLE_TAKER` (run one style at a time while validating).
+
+## Known gaps / extension ideas
+
+- **LMAX Digital / itBit books** aren't public; the BRTI replica runs on
+  Coinbase + Kraken + Bitstamp + Gemini. Add a feed adapter in
+  `src/brti/feeds/` (5-minute job) if you have access to another
+  constituent's data.
+- **Queue-position modeling** for paper maker fills (currently optimistic).
+- **Order amend** instead of cancel/replace once Kalshi's amend endpoint is
+  verified — halves write-token spend per reprice.
+- **Multi-market**: `KXETH15M` runs on the same machinery; run a second
+  instance with a different `.env` rather than one process trading both
+  until you've watched inventory behavior for a while.
+- **Persistence**: positions/PnL are in-memory; live restarts reconcile
+  against `get_positions` but historical fills aren't stored. Pipe
+  `logs/trades.csv` somewhere durable if you need an audit trail.
