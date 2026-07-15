@@ -20,6 +20,7 @@ use the demo environment while testing).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
 import math
@@ -118,7 +119,11 @@ class Bot:
             self.estimator.register(feed.name, feed.book)
 
         try:
-            self.signer: KalshiSigner | None = KalshiSigner(cfg.kalshi_api_key_id, cfg.kalshi_private_key_path)
+            if cfg.kalshi_private_key_b64:
+                pem = base64.b64decode(cfg.kalshi_private_key_b64)
+                self.signer: KalshiSigner | None = KalshiSigner(cfg.kalshi_api_key_id, private_key_pem=pem)
+            else:
+                self.signer = KalshiSigner(cfg.kalshi_api_key_id, cfg.kalshi_private_key_path)
         except (FileNotFoundError, ValueError):
             self.signer = None
         if self.signer is None or not cfg.kalshi_api_key_id:

@@ -93,11 +93,27 @@ Module map:
 
 ## Setup
 
+**Easiest path (no manual commands):** download the repo (green "Code"
+button → Download ZIP → extract), then:
+
+- **Windows:** double-click `start.bat`
+- **Mac/Linux:** open Terminal in the folder and run `bash start.sh`
+
+The script installs everything, asks for your Kalshi API key ID and the
+downloaded `.pem` file on first run, and starts the bot in paper mode.
+
+**Manual path:**
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
+
+**Cloud / file-less credentials:** instead of a `.pem` path you can supply
+the key as one env var — `KALSHI_PRIVATE_KEY_B64` (the PEM base64-encoded
+into a single line: `base64 -w0 kalshi_private_key.pem`). Useful where
+secrets must be environment variables.
 
 ### Kalshi credentials (needed even for paper mode)
 

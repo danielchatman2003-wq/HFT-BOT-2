@@ -42,6 +42,10 @@ class Config:
     # ---- Kalshi credentials / environment ----
     kalshi_api_key_id: str = os.getenv("KALSHI_API_KEY_ID", "")
     kalshi_private_key_path: str = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private_key.pem")
+    # Alternative to the path: the PEM contents base64-encoded into a single
+    # line -- convenient for cloud environments where secrets are env vars.
+    #   base64 -w0 kalshi_private_key.pem     (macOS: base64 -i file.pem)
+    kalshi_private_key_b64: str = os.getenv("KALSHI_PRIVATE_KEY_B64", "")
     kalshi_env: str = os.getenv("KALSHI_ENV", "demo")  # demo | prod
     kalshi_base_url_override: str = os.getenv("KALSHI_BASE_URL", "")
     kalshi_ws_url_override: str = os.getenv("KALSHI_WS_URL", "")

@@ -19,10 +19,17 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 
 class KalshiSigner:
-    def __init__(self, key_id: str, private_key_path: str) -> None:
+    def __init__(self, key_id: str, private_key_path: str | None = None,
+                 private_key_pem: bytes | None = None) -> None:
+        """Load the RSA key from a PEM file path, or directly from PEM bytes
+        (used by KALSHI_PRIVATE_KEY_B64 for file-less cloud setups)."""
         self.key_id = key_id
-        with open(private_key_path, "rb") as f:
-            self._private_key = serialization.load_pem_private_key(f.read(), password=None)
+        if private_key_pem is None:
+            if not private_key_path:
+                raise ValueError("provide private_key_path or private_key_pem")
+            with open(private_key_path, "rb") as f:
+                private_key_pem = f.read()
+        self._private_key = serialization.load_pem_private_key(private_key_pem, password=None)
 
     def sign(self, timestamp_ms: str, method: str, signed_path: str) -> str:
         message = f"{timestamp_ms}{method}{signed_path}".encode("utf-8")
