@@ -10,19 +10,26 @@ final 60 one-second BRTI prints* before close.
 This bot's entire premise is to price that contract slightly better and
 slightly faster than the market by:
 
-1. **Replicating the BRTI in real time** from the same constituent exchange
-   order books CF Benchmarks uses (published methodology: consolidated book →
-   mid price-volume curve → utilized depth capped at 0.5% deviation, min
-   1 BTC → exponentially weighted mid with λ = 10.3), instead of watching a
-   single exchange's last trade.
+1. **Trading off the settlement index itself.** Kalshi streams the official
+   CF Benchmarks BRTI over its websocket (`cfbenchmarks_value` channel),
+   including — during the final minute of each quarter-hour — the exact
+   running settlement average. The bot consumes that as its primary index,
+   and *also* runs a local BRTI replica built from the constituent exchange
+   order books (CF's published methodology: consolidated book → mid
+   price-volume curve → utilized depth capped at 0.5% deviation, min 1 BTC →
+   exponentially weighted mid, λ = 10.3) as a fallback and a continuous
+   cross-check (`BRTI_SOURCE=auto`).
 2. **Pricing the settlement average correctly.** A 60-second average is less
    volatile than a point close (variance `σ²(a + w/3)`, not `σ²(a + w)`),
    and inside the final minute part of the average is *already realized* —
-   the bot tracks the locked-in ticks and reprices as certainty accrues,
-   which is exactly when markets are most often mispriced.
-3. **Reacting on events, not polls**: Kalshi order book deltas over
-   websocket, 1 Hz index ticks, fills — with maker quotes and taker sweeps
-   driven off a single async event loop.
+   the bot tracks the locked-in ticks (officially streamed, exact) and
+   reprices as certainty accrues, which is exactly when markets are most
+   often mispriced.
+3. **Reacting on events, not polls**: Kalshi order book deltas, official
+   index ticks, lifecycle events (strike, close changes, instant settlement
+   results), and fills — all over one websocket, driving maker quotes and
+   taker sweeps from a single async event loop. Market rolls every 15
+   minutes are handled with `update_subscription`, not reconnects.
 
 **Read this before running anything:**
 
@@ -40,17 +47,20 @@ slightly faster than the market by:
 ## Architecture
 
 ```
- Coinbase ─┐                                        ┌──────────────┐
- Kraken   ─┤  L2 books   ┌─────────────────┐  1 Hz  │ EWMA vol     │
- Bitstamp ─┼────────────▶│ BRTI estimator  │───────▶│ (per-√sec)   │
- Gemini   ─┘             │ (CF methodology)│        └──────┬───────┘
+ Kalshi ws: official BRTI ────────┐ (primary index + exact
+ (cfbenchmarks_value, 1/sec)      │  settlement-window average)
+                                  ▼
+ Coinbase ─┐             ┌─────────────────┐        ┌──────────────┐
+ Kraken   ─┤  L2 books   │ IndexSource     │───────▶│ EWMA vol     │
+ Bitstamp ─┼────────────▶│ official-first, │        │ (per-√sec)   │
+ Gemini   ─┘  (replica)  │ replica fallback│        └──────┬───────┘
                          └────────┬────────┘               │
                                   │ index ticks +          │ σ
                                   │ settlement-window sum  │
                                   ▼                        ▼
  Kalshi ws ──────────────▶ ┌──────────────────────────────────┐
- (orderbook_delta,         │  UpDownStrategy                  │
-  trade, fill)             │  fair = P(60s avg > strike)      │
+ (orderbook_delta, trade,  │  UpDownStrategy                  │
+  lifecycle, fill)         │  fair = P(60s avg > strike)      │
                            │  taker: IOC when edge > fee+min  │
                            │  maker: post-only quotes, vol-   │
                            │  adaptive spread, inventory skew │
@@ -121,14 +131,22 @@ Tests: `pytest tests/ -v` (77 tests, all offline — pricing math, BRTI
 aggregation, book maintenance across both wire formats, fees, risk gates,
 paper fills, and strategy decisions).
 
-## Verify before going live — this matters
+## Verified vs. verify-before-live
 
-This bot was written in an environment where `docs.kalshi.com`,
-`api.elections.kalshi.com`, and CF Benchmarks' site were **blocked by
-network policy**, so several facts were taken from Kalshi's published
-examples and third-party documentation rather than confirmed against the
-live API. All of them are cheap to check on the demo environment, and the
-bot is built to make each one a config change, not a code change:
+The **websocket layer is built against Kalshi's official AsyncAPI spec**:
+host (`wss://external-api-ws.kalshi.com/trade-api/ws/v2`), the
+`orderbook_delta`/`trade`/`fill` message shapes (dollar fixed-point fields,
+canonical `outcome_side`/`book_side` direction, actual `fee_cost` on fills,
+`post_position_fp` drift checks), the `cfbenchmarks_value` official index
+stream and its settlement-window semantics (`(close−60s, close]`, start
+tick excluded, close tick included, 60 ticks), `market_lifecycle_v2`
+metadata (strike / close changes / `price_ranges` tick bands / instant
+`determined` results), `update_subscription` market rolls, and terminal
+error codes (10/17/25 → resubscribe).
+
+The **REST side could not be verified** from the build environment
+(network policy blocked the API hosts), so check these cheaply on demo
+before live — each is a config change, not a code change:
 
 1. **Order wire format** (`KALSHI_ORDER_API`): default `v2` posts to
    `/portfolio/events/orders` with `side: bid/ask` and decimal dollar
@@ -138,36 +156,40 @@ bot is built to make each one a config change, not a code change:
 2. **Fee rates** (`TAKER_FEE_RATE`, `MAKER_FEE_RATE`): crypto series carry
    a higher multiplier than the general 0.07 and a reduced maker rate.
    Check [kalshi.com/fee-schedule](https://kalshi.com/fee-schedule); the
-   defaults here (0.10 / 0.025) deliberately overestimate.
+   defaults here (0.10 / 0.025) deliberately overestimate. (Live fills
+   report the actual fee via `fee_cost`, which the accounting uses
+   directly — the configured rates then only gate *pre-trade* edge.)
 3. **Series ticker** (`SERIES_TICKER`): `KXBTC15M` is the BTC 15-minute
    Up/Down series as of mid-2026; Kalshi renames series occasionally. The
    discovery loop logs what it finds — if it finds nothing, browse
-   kalshi.com's crypto section for the current name (`KXETH15M` for ETH).
-4. **Strike field**: the "price to beat" is read from the market's
-   `floor_strike` (with fallbacks). The tracking log line prints it — sanity
-   check it against the Kalshi UI for one window before trusting it.
-5. **Settlement mechanics**: contracts settle on the 60-second BRTI mean;
-   `SETTLEMENT_WINDOW_S`/`SETTLEMENT_TICKS` encode that and are
-   configurable if Kalshi's rulebook changes.
+   kalshi.com's crypto section for the current name (`KXETH15M` for ETH,
+   with `BRTI_INDEX_ID=ETHUSD_RTI`).
+4. **Strike field**: the "price to beat" arrives via `floor_strike` on the
+   market object and `market_lifecycle_v2` metadata updates. The tracking
+   log prints it — sanity check against the Kalshi UI for one window.
+5. **Demo websocket host**: the spec documents production only; the demo
+   default here is `wss://demo-api.kalshi.co` (override with
+   `KALSHI_WS_URL` if demo lives elsewhere).
 
 ## Where the edge is supposed to come from (and where it leaks)
 
-- **BRTI vs single-exchange watchers.** Settlement is on a consolidated
-  index. Bots (and humans) pricing off Coinbase's last trade are pricing
-  the wrong underlying by a few dollars — small, but binaries near the
-  strike amplify small differences enormously in the final minutes.
+- **The settlement index itself, live.** The bot prices off the official
+  BRTI stream (and the exact running settlement average in the final
+  minute) while slower participants watch a single exchange's last trade —
+  pricing the wrong underlying by a few dollars, which binaries near the
+  strike amplify enormously in the final minutes.
 - **The averaging window.** Correctly pricing `P(avg > K)` — especially the
-  realized-tick collapse inside the last 60 seconds — is this bot's largest
-  systematic differentiator. A market quoting 12c of uncertainty when 50 of
-  60 ticks are locked in is offering nearly free money *if your index
-  replica is accurate*.
+  realized-tick collapse inside the last 60 seconds, now fed by the exact
+  official window — is this bot's largest systematic differentiator. A
+  market quoting 12c of uncertainty when 50 of 60 ticks are locked in is
+  offering nearly free money.
 - **Where it leaks:** taker fees at mid-probability prices (~2-3c round
   trip), adverse selection on resting quotes (you get filled precisely when
-  fair value moved through you faster than you repriced), REST order
-  latency against other bots, and any systematic error between this BRTI
-  replica and the real print (LMAX Digital's book is not public, so the
-  replica is a subset of constituents). `MIN_TAKER_EDGE_CENTS` /
-  `MIN_MAKER_EDGE_CENTS` exist to demand enough margin to survive all four.
+  fair value moved through you faster than you repriced), and REST order
+  latency against other bots consuming the same official stream — that last
+  one is the real competition. `MIN_TAKER_EDGE_CENTS` /
+  `MIN_MAKER_EDGE_CENTS` exist to demand enough margin to survive all
+  three.
 
 ## Risk controls (all enforced independently of the strategy)
 

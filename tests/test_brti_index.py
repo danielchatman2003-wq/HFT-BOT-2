@@ -117,6 +117,21 @@ def test_sample_and_window_stats():
     assert total == pytest.approx(sum(100_000.0 + i for i in range(10)))
 
 
+def test_window_stats_boundaries_match_kalshi_semantics():
+    """Kalshi's settlement window is (close-60, close]: the tick exactly at
+    the start boundary is EXCLUDED, the close tick is INCLUDED."""
+    est = make_estimator()
+    close_ts = 2000.0
+    est.samples.extend([
+        (1940.0, 111.0),   # exactly at close-60: excluded
+        (1941.0, 100.0),   # first included tick
+        (2000.0, 200.0),   # close tick: included
+    ])
+    total, count = est.window_stats(close_ts, window_s=60.0, now=2000.5)
+    assert count == 2
+    assert total == pytest.approx(300.0)
+
+
 def test_sample_records_rounded_value():
     est = make_estimator()
     est.register("x", symmetric_book(100_000.335, 0.01))

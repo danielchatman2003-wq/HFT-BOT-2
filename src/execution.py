@@ -175,11 +175,22 @@ class ExecutionBase:
             order.filled += abs(fill.signed_count)
             if order.remaining <= 0:
                 self.orders.pop(order.client_order_id, None)
-        if fee_rate is None:
-            fee_rate = self.cfg.taker_fee_rate if fill.is_taker else self.cfg.maker_fee_rate
+        if fill.fee is not None:
+            fee = fill.fee  # actual exchange fee from the fill channel
+        else:
+            if fee_rate is None:
+                fee_rate = self.cfg.taker_fee_rate if fill.is_taker else self.cfg.maker_fee_rate
+            fee = order_fee(fill.price, abs(fill.signed_count), fee_rate)
         pos = self.position(fill.ticker)
         realized_delta = pos.apply_fill(fill.signed_count, fill.price)
-        fee = order_fee(fill.price, abs(fill.signed_count), fee_rate)
+        if fill.post_position is not None:
+            exchange_pos = int(round(fill.post_position))
+            if exchange_pos != pos.pos:
+                logger.warning(
+                    "position drift on %s: local %+d vs exchange %+d -- adopting exchange",
+                    fill.ticker, pos.pos, exchange_pos,
+                )
+                pos.pos = exchange_pos
         pos.fees += fee
         if realized_delta or fee:
             self.risk.on_realized_pnl(realized_delta - fee)
@@ -212,6 +223,14 @@ class ExecutionBase:
                 ticker, "YES" if result_yes else "NO", had, realized_delta, pos.fees, pos.realized - pos.fees,
             )
         return realized_delta
+
+    # ---- private-channel hooks (live overrides; no-ops elsewhere) ----
+
+    def on_order_update(self, body: dict) -> None:
+        pass
+
+    def on_position_update(self, body: dict) -> None:
+        pass
 
     # ---- to implement ----
 
@@ -283,6 +302,47 @@ class LiveExecution(ExecutionBase):
         ids = [o.order_id for o in targets if o.order_id]
         if ids:
             await self.rest.batch_cancel(ids)
+
+    # ---- private websocket channels (user_orders / market_positions) ----
+
+    def on_order_update(self, body: dict) -> None:
+        """user_orders channel: authoritative order state. Server-side TTL
+        expiries and cancels show up here without any local action."""
+        status = (body.get("status") or "").lower()
+        oid = str(body.get("order_id", ""))
+        coid = str(body.get("client_order_id", ""))
+        order = self.orders.get(coid)
+        if order is None and oid:
+            order = next((o for o in self.orders.values() if o.order_id == oid), None)
+        if order is None:
+            return
+        if not order.order_id and oid:
+            order.order_id = oid
+        if status in ("canceled", "executed"):
+            self.orders.pop(order.client_order_id, None)
+        else:
+            try:
+                order.filled = int(float(body.get("fill_count_fp", order.filled)))
+            except (TypeError, ValueError):
+                pass
+
+    def on_position_update(self, body: dict) -> None:
+        """market_positions channel: authoritative net position. Local
+        accounting should already agree via fills; adopt + warn if not."""
+        ticker = body.get("market_ticker")
+        if not ticker:
+            return
+        try:
+            exchange_pos = int(round(float(body.get("position_fp"))))
+        except (TypeError, ValueError):
+            return
+        pos = self.position(ticker)
+        if exchange_pos != pos.pos:
+            logger.warning(
+                "position drift on %s (market_positions): local %+d vs exchange %+d -- adopting exchange",
+                ticker, pos.pos, exchange_pos,
+            )
+            pos.pos = exchange_pos
 
 
 class PaperExecution(ExecutionBase):

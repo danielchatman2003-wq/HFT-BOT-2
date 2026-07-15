@@ -102,7 +102,7 @@ def run_backtest(series: list[tuple[float, float]], seed: int = 7) -> list[Windo
             tau = close_ts - sec
             if tau <= cfg.taker_stop_before_close_s:
                 break
-            if tau <= AVG_S:
+            if tau < AVG_S:  # Kalshi's window is (close-60, close]: start tick excluded
                 realized_sum += round(px, 2)
                 realized_n += 1
 

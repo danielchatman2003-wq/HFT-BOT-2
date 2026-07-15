@@ -212,15 +212,16 @@ class BrtiEstimator:
         return (now - self.last_ts) * 1000.0
 
     def window_stats(self, close_ts: float, window_s: float = 60.0, now: float | None = None) -> tuple[float, int]:
-        """(sum, count) of samples inside a market's settlement window
-        [close_ts - window_s, close_ts), up to now. This is the realized part
-        of the settlement average."""
+        """(sum, count) of samples inside a market's settlement window, up to
+        now. Kalshi's official window semantics (per the AsyncAPI spec) are
+        `(close - 60s, close]`: the start-boundary tick is excluded and the
+        close tick is included."""
         now = now if now is not None else time.time()
         start = close_ts - window_s
         total = 0.0
         count = 0
         for ts, v in self.samples:
-            if start <= ts < close_ts and ts <= now:
+            if start < ts <= close_ts and ts <= now:
                 total += v
                 count += 1
         return total, count

@@ -23,10 +23,12 @@ by construction.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 
 from src.brti.index import BrtiEstimator
+from src.brti.source import IndexSource
 from src.config import Config
 from src.execution import ExecutionBase
 from src.fees import fee_per_contract
@@ -43,6 +45,9 @@ class MarketState:
     close_ts: float
     strike: float | None = None
     settled: bool = False
+    # Price bands from market_lifecycle_v2 (price_ranges): the market's real
+    # tick structure, e.g. deci-cent near the extremes. None -> global tick.
+    price_ranges: list[tuple[float, float, float]] | None = None  # (start, end, step)
     last_take_ts: dict[int, float] = field(default_factory=dict)      # direction -> ts
     last_replace_ts: dict[str, float] = field(default_factory=dict)   # "bid"/"ask" -> ts
     takes: int = 0
@@ -56,7 +61,7 @@ class UpDownStrategy:
     def __init__(
         self,
         cfg: Config,
-        estimator: BrtiEstimator,
+        estimator: IndexSource | BrtiEstimator,
         vol: EwmaVol,
         books: dict[str, KalshiBook],
         execution: ExecutionBase,
@@ -86,6 +91,23 @@ class UpDownStrategy:
             if strike is not None and m.strike != strike:
                 m.strike = strike
                 logger.info("%s strike (price to beat): %s", ticker, f"{strike:,.2f}")
+
+    def apply_metadata(self, ticker: str, strike: float | None = None,
+                       close_ts: float | None = None,
+                       price_ranges: list[tuple[float, float, float]] | None = None) -> None:
+        """Apply market_lifecycle_v2 metadata to a tracked market: the strike
+        ('price to beat'), close-time changes, and the tick-band structure."""
+        m = self.markets.get(ticker)
+        if m is None:
+            return
+        if strike is not None and m.strike != strike:
+            m.strike = strike
+            logger.info("%s strike (price to beat): %s", ticker, f"{strike:,.2f}")
+        if close_ts is not None and abs(m.close_ts - close_ts) > 0.5:
+            logger.info("%s close time changed by %+.0fs", ticker, close_ts - m.close_ts)
+            m.close_ts = close_ts
+        if price_ranges:
+            m.price_ranges = price_ranges
 
     def drop_market(self, ticker: str) -> None:
         self.markets.pop(ticker, None)
@@ -227,15 +249,15 @@ class UpDownStrategy:
         )
         skew = half_spread * (pos / self.cfg.max_pos_per_market) if self.cfg.max_pos_per_market else 0.0
 
-        bid_target = self._floor_tick(fair - half_spread - skew)
-        ask_target = self._ceil_tick(fair + half_spread - skew)
+        bid_target = self._floor_tick(fair - half_spread - skew, m)
+        ask_target = self._ceil_tick(fair + half_spread - skew, m)
         mkt_bid, mkt_ask = book.bbo()
-        if mkt_ask is not None:
-            bid_target = min(bid_target, self._floor_tick(mkt_ask - tick))  # never cross
+        if mkt_ask is not None:  # never cross the market
+            bid_target = min(bid_target, self._floor_tick(mkt_ask - self._step_at(m, mkt_ask), m))
         if mkt_bid is not None:
-            ask_target = max(ask_target, self._ceil_tick(mkt_bid + tick))
+            ask_target = max(ask_target, self._ceil_tick(mkt_bid + self._step_at(m, mkt_bid), m))
         bid_target = min(max(bid_target, tick), 1.0 - 2 * tick)
-        ask_target = min(max(ask_target, bid_target + tick), 1.0 - tick)
+        ask_target = min(max(ask_target, bid_target + self._step_at(m, bid_target)), 1.0 - tick)
 
         bid_size = self.risk.quote_size(+1, pos, collateral)
         ask_size = self.risk.quote_size(-1, pos, collateral)
@@ -281,13 +303,27 @@ class UpDownStrategy:
         for m in self.markets.values():
             await self._cancel_quotes(m)
 
-    def _floor_tick(self, p: float) -> float:
-        t = self.cfg.price_tick
-        return round((p // t) * t, 4) if t > 0 else p
+    def _step_at(self, m: MarketState | None, price: float) -> float:
+        """Tick size at `price`: the market's price band step when known
+        (markets are not uniformly 1c -- e.g. deci-cent near the extremes),
+        else the configured global tick."""
+        if m is not None and m.price_ranges:
+            for start, end, step in m.price_ranges:
+                if start - 1e-9 <= price <= end + 1e-9 and step > 0:
+                    return step
+            last_step = m.price_ranges[-1][2]
+            if last_step > 0:
+                return last_step
+        return self.cfg.price_tick
 
-    def _ceil_tick(self, p: float) -> float:
-        t = self.cfg.price_tick
-        if t <= 0:
+    def _floor_tick(self, p: float, m: MarketState | None = None) -> float:
+        step = self._step_at(m, p)
+        if step <= 0:
             return p
-        n = p / t
-        return round((int(n) if abs(n - int(n)) < 1e-9 else int(n) + 1) * t, 4)
+        return round(math.floor(p / step + 1e-9) * step, 6)
+
+    def _ceil_tick(self, p: float, m: MarketState | None = None) -> float:
+        step = self._step_at(m, p)
+        if step <= 0:
+            return p
+        return round(math.ceil(p / step - 1e-9) * step, 6)

@@ -166,6 +166,34 @@ def test_settle_market_realizes_and_stops():
     assert pnl > 0  # bought ~55c, settled at $1
 
 
+def test_price_band_aware_tick_rounding():
+    """Markets carry per-band tick sizes (price_ranges); quote rounding must
+    use the band's step, not a global 1c assumption."""
+    strat, ex, est, books, now = make_world(spot=100_000.0, book_yes_bid=48, book_no_bid=48)
+    m = strat.markets["T"]
+    strat.apply_metadata("T", price_ranges=[(0.0, 0.04, 0.001), (0.04, 0.96, 0.01), (0.96, 1.0, 0.001)])
+    assert strat._step_at(m, 0.02) == pytest.approx(0.001)
+    assert strat._step_at(m, 0.50) == pytest.approx(0.01)
+    assert strat._step_at(m, 0.99) == pytest.approx(0.001)
+    assert strat._floor_tick(0.0333, m) == pytest.approx(0.033)
+    assert strat._ceil_tick(0.0333, m) == pytest.approx(0.034)
+    assert strat._floor_tick(0.4567, m) == pytest.approx(0.45)
+    assert strat._ceil_tick(0.4567, m) == pytest.approx(0.46)
+    # Exact tick values round to themselves.
+    assert strat._floor_tick(0.45, m) == pytest.approx(0.45)
+    assert strat._ceil_tick(0.45, m) == pytest.approx(0.45)
+
+
+def test_apply_metadata_updates_state():
+    strat, ex, est, books, now = make_world(spot=100_000.0, book_yes_bid=48, book_no_bid=48)
+    m = strat.markets["T"]
+    old_close = m.close_ts
+    strat.apply_metadata("T", strike=100_123.0, close_ts=old_close - 120.0)
+    assert m.strike == pytest.approx(100_123.0)
+    assert m.close_ts == pytest.approx(old_close - 120.0)
+    strat.apply_metadata("UNKNOWN", strike=1.0)  # unknown ticker: no crash
+
+
 def test_fair_uses_realized_ticks_inside_window():
     """55 of 60 settlement ticks locked in above strike must produce a fair
     near 1 even with spot back at the strike."""

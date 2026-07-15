@@ -53,6 +53,11 @@ class Config:
     # which was not reachable from the environment this was written in.
     kalshi_order_api: str = os.getenv("KALSHI_ORDER_API", "v2")  # v2 | legacy
 
+    # Kalshi is migrating no-side orderbook prices to yes-leg pricing
+    # (`use_yes_price` subscribe flag; default currently false, will flip).
+    # When true, we request and parse yes-leg pricing on the no side.
+    kalshi_use_yes_price: bool = _b("KALSHI_USE_YES_PRICE", False)
+
     # ---- market selection ----
     series_ticker: str = os.getenv("SERIES_TICKER", "KXBTC15M")
     market_poll_seconds: float = _f("MARKET_POLL_SECONDS", 20.0)
@@ -69,7 +74,14 @@ class Config:
     taker_fee_rate: float = _f("TAKER_FEE_RATE", 0.10)
     maker_fee_rate: float = _f("MAKER_FEE_RATE", 0.025)
 
-    # ---- BRTI estimator ----
+    # ---- BRTI source ----
+    # auto     -> official Kalshi-streamed CF value when fresh, replica fallback
+    # official -> only the cfbenchmarks_value websocket feed
+    # replica  -> only the local constituent-book estimator
+    brti_source: str = os.getenv("BRTI_SOURCE", "auto")
+    brti_index_id: str = os.getenv("BRTI_INDEX_ID", "BRTI")  # ETH: ETHUSD_RTI
+
+    # ---- BRTI replica estimator ----
     brti_feeds: tuple[str, ...] = field(default_factory=lambda: _list("BRTI_FEEDS", "coinbase,kraken,bitstamp,gemini"))
     brti_lambda: float = _f("BRTI_LAMBDA", 10.3)          # exp-weight decay (CF methodology)
     brti_deviation_cap: float = _f("BRTI_DEVIATION_CAP", 0.005)  # utilized-depth half-spread cap (0.5%)
@@ -132,7 +144,9 @@ class Config:
         if self.kalshi_ws_url_override:
             return self.kalshi_ws_url_override.rstrip("/")
         if self.kalshi_env == "prod":
-            return "wss://api.elections.kalshi.com"
+            # Per Kalshi's AsyncAPI spec: the production websocket lives on a
+            # dedicated host, not the REST host.
+            return "wss://external-api-ws.kalshi.com"
         return "wss://demo-api.kalshi.co"
 
     @property
